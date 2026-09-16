@@ -11,7 +11,11 @@ from datetime import datetime
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
-PROMPT_PATH = BASE / "Promt" / "Promt meeting v5.2.md"
+# Промпты один в один с продуктового сервера: системный и шаблон сообщения пользователя.
+SYSTEM_PROMPT_PATH = BASE / "Promt" / "System promt.md"
+USER_PROMPT_PATH = BASE / "Promt" / "User promt.md"
+# На сервере [Date] и [Users] подставляет n8n из базы, на стенде их нет.
+UNKNOWN_FIELD = "Уточнити"
 MEETING_DIR = BASE / "Meeting"
 RESULTS_DIR = BASE / "results"
 DEFAULT_TRANSCRIPT = MEETING_DIR / "Зустріч МТА.txt"
@@ -49,9 +53,8 @@ SECTION_TITLES = {
     4: "Технічні та специфічні деталі",
     5: "Прийняті рішення",
     6: "План дій",
-    7: "Реєстр ризиків",
-    8: "Наступні кроки",
-    9: "Примітки",
+    7: "Наступні кроки",
+    8: "Примітки",
 }
 
 RUBRIC = """## Что нужно сделать
@@ -250,20 +253,28 @@ def check_protocol(text: str) -> dict:
         "sections": found,
         "missing": [n for n in SECTION_TITLES if n not in found],
         "utochnyty": len(re.findall(r"Уточнити", text, re.IGNORECASE)),
-        "tables": text.count("| ---") + text.count("|---"),
+        "tables": text.count("| ---") + text.count("|---") + text.lower().count("<table"),
         "dates": len(set(re.findall(r"\b\d{2}[.\-/]\d{2}[.\-/]\d{4}\b", text))),
     }
 
 
-def run_model(model: dict, system: str, transcript: str, api_key: str | None) -> dict:
+def build_user_message(template: str, transcript: str, date: str, users: str) -> str:
+    return (
+        template.replace("[Date]", date)
+        .replace("[Users]", users)
+        .replace("[Transcription]", transcript)
+    )
+
+
+def run_model(model: dict, system: str, user: str, api_key: str | None) -> dict:
     started = time.time()
     try:
         if model["kind"] == "ollama":
-            result = call_ollama(model, system, transcript)
+            result = call_ollama(model, system, user)
         else:
             if not api_key:
                 raise RuntimeError("нет ключа OPENROUTER_API_KEY")
-            result = call_openrouter(model, system, transcript, api_key)
+            result = call_openrouter(model, system, user, api_key)
         result["error"] = None
     except Exception as error:
         result = {
@@ -355,7 +366,7 @@ def write_outputs(out_dir: Path, transcript_name: str, transcript: str, store: d
         "",
         "**Здесь видно, где какая модель. Открывать после того, как оценка по `for_opus.md` выставлена.**",
         "",
-        "| Модель | Токены вход | Токены выход | Стоимость, $ | Время, с | Символов | Разделов из 9 | «Уточнити» | Обрезка |",
+        f"| Модель | Токены вход | Токены выход | Стоимость, $ | Время, с | Символов | Разделов из {len(SECTION_TITLES)} | «Уточнити» | Обрезка |",
         "|---|---|---|---|---|---|---|---|---|",
     ]
     prices = fetch_pricing()
@@ -418,6 +429,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Сравнение моделей на протоколе встречи")
     parser.add_argument("--transcript", type=Path, default=DEFAULT_TRANSCRIPT)
     parser.add_argument("--models", help="список меток через запятую, например gpt-oss-20b,gpt-4.1-mini")
+    parser.add_argument("--date", default=UNKNOWN_FIELD, help="что подставить в [Date] шаблона")
+    parser.add_argument("--users", default=UNKNOWN_FIELD, help="что подставить в [Users] шаблона")
     parser.add_argument("--list", action="store_true", help="показать кандидатов и выйти")
     parser.add_argument("--rebuild", action="store_true", help="пересобрать файлы из runs.json, без запросов к моделям")
     args = parser.parse_args()
@@ -454,19 +467,21 @@ def main() -> int:
     if not args.transcript.exists():
         print(f"Нет файла стенограммы: {args.transcript}")
         return 1
-    if not PROMPT_PATH.exists():
-        print(f"Нет файла промпта: {PROMPT_PATH}")
-        return 1
+    for path in (SYSTEM_PROMPT_PATH, USER_PROMPT_PATH):
+        if not path.exists():
+            print(f"Нет файла промпта: {path}")
+            return 1
 
-    system = read_text(PROMPT_PATH).strip()
+    system = read_text(SYSTEM_PROMPT_PATH).strip()
     transcript = read_text(args.transcript).strip()
+    user = build_user_message(read_text(USER_PROMPT_PATH).strip(), transcript, args.date, args.users)
     api_key = load_api_key()
     if not api_key and any(m["kind"] == "openrouter" for m in selected):
         print("Нет ключа: искал", " и ".join(KEY_NAMES), "в", ", ".join(str(p) for p in ENV_FILES), "и в окружении")
         return 1
 
     print(f"Стенограмма: {args.transcript.name}, {len(transcript)} символов, ~{estimate_tokens(transcript)} токенов")
-    print(f"Промпт: {PROMPT_PATH.name}, {len(system)} символов")
+    print(f"Промпты: {SYSTEM_PROMPT_PATH.name} {len(system)} символов, {USER_PROMPT_PATH.name} с датой «{args.date}», участниками «{args.users}»")
     print(f"Моделей в прогоне: {len(selected)}\n")
 
     out_dir = RESULTS_DIR / args.transcript.stem
@@ -476,7 +491,7 @@ def main() -> int:
 
     for model in selected:
         print(f"[{model['label']}] запуск...", flush=True)
-        result = run_model(model, system, transcript, api_key)
+        result = run_model(model, system, user, api_key)
         if result["error"]:
             print(f"[{model['label']}] ошибка: {result['error']}")
         else:

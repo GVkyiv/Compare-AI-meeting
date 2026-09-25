@@ -18,11 +18,10 @@ USER_PROMPT_PATH = BASE / "Promt" / "User promt.md"
 UNKNOWN_FIELD = "Уточнити"
 MEETING_DIR = BASE / "Meeting"
 RESULTS_DIR = BASE / "results"
-DEFAULT_TRANSCRIPT = MEETING_DIR / "Зустріч МТА.txt"
+DEFAULT_TRANSCRIPT = next(MEETING_DIR.glob("*.txt"), MEETING_DIR / "transcript.txt")
 
 ENV_FILES = [
     BASE / ".env",
-    Path(r"D:\Documents\Google Drive\AI Project\Study\Openroute\.env"),
 ]
 KEY_NAMES = ("OPENROUTER_API_KEY", "OPEN_ROUTER_API")
 

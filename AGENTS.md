@@ -57,7 +57,7 @@ python compare.py --transcript "Meeting/имя-файла.txt"
 
 Для просмотра истории и метрик в интерфейсе MLflow:
 ```
-mlflow ui
+py -m mlflow ui --workers 1
 ```
 
 Ключ ищется в `.env` рядом со скриптом (`OPENROUTER_API_KEY`,

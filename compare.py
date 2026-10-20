@@ -28,7 +28,7 @@ MEETING_DIR = BASE / "Meeting"
 RESULTS_DIR = BASE / "results"
 DEFAULT_TRANSCRIPT = next(MEETING_DIR.glob("*.txt"), MEETING_DIR / "transcript.txt")
 MLFLOW_EXPERIMENT_NAME = "meeting-protocol-eval"
-MLFLOW_DIR = BASE / "mlruns"
+MLFLOW_DB_PATH = BASE / "mlflow.db"
 
 ENV_FILES = [
     BASE / ".env",
@@ -39,20 +39,19 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 TEMPERATURE = 0
 REQUEST_TIMEOUT = 1800
-OUTPUT_RESERVE_TOKENS = 4000
+OUTPUT_RESERVE_TOKENS = 6000
 
 # Список кандидатов. kind: openrouter или ollama. enabled: участвует ли в прогоне.
 MODELS = [
-    {"label": "qwen3.8-27b-ud", "kind": "ollama", "id": "Qwen3.8-27B-UD-Q6_K_XL", "enabled": True},
-    {"label": "command-r-35b", "kind": "ollama", "id": "command-r:35b", "enabled": True},
-    {"label": "mistral-small-24b", "kind": "ollama", "id": "mistral-small:24b", "enabled": True},
-    {"label": "qwen2.5-32b", "kind": "ollama", "id": "qwen2.5:32b-instruct", "enabled": True},
+    {"label": "qwen3.8-27b", "kind": "openrouter", "id": "qwen/qwen3.8-27b", "enabled": True},
+    {"label": "mistral-small-24b", "kind": "openrouter", "id": "mistralai/mistral-small-3.2-24b-instruct", "enabled": True},
+    {"label": "qwen3-32b", "kind": "openrouter", "id": "qwen/qwen3-32b", "enabled": True},
+    {"label": "command-r-35b", "kind": "ollama", "id": "command-r:35b", "enabled": False},
     {"label": "gpt-oss-20b", "kind": "openrouter", "id": "openai/gpt-oss-20b", "enabled": False},
     {"label": "gpt-oss-120b", "kind": "openrouter", "id": "openai/gpt-oss-120b", "enabled": False},
     {"label": "qwen3.5-27b", "kind": "openrouter", "id": "qwen/qwen3.5-27b", "enabled": False},
     {"label": "gpt-4.1-mini", "kind": "openrouter", "id": "openai/gpt-4.1-mini", "enabled": False},
     {"label": "gpt-5.6-luna", "kind": "openrouter", "id": "openai/gpt-5.6-luna", "enabled": False},
-    {"label": "qwen3.8-27b", "kind": "openrouter", "id": "qwen/qwen3.8-27b", "enabled": False},
     {"label": "gpt-oss-20b-local", "kind": "ollama", "id": "gpt-oss-20b-GGUF:Q4_K_M", "enabled": False},
     {"label": "qwen3.5-local", "kind": "ollama", "id": "qwen3.5:latest", "enabled": False},
 ]
@@ -186,6 +185,8 @@ def call_openrouter(model: dict, system: str, user: str, api_key: str) -> dict:
             {"role": "user", "content": user},
         ],
         "temperature": TEMPERATURE,
+        "max_tokens": OUTPUT_RESERVE_TOKENS,
+        "reasoning": {"effort": "low"},
         "usage": {"include": True},
     }
     headers = {
@@ -193,9 +194,20 @@ def call_openrouter(model: dict, system: str, user: str, api_key: str) -> dict:
         "X-Title": "Compare AI meeting",
     }
     last_error = None
+    data = None
     for attempt in range(3):
         try:
             data = post_json(OPENROUTER_URL, payload, headers, REQUEST_TIMEOUT)
+            if "error" in data and not data.get("choices"):
+                raise RuntimeError(json.dumps(data["error"], ensure_ascii=False)[:300])
+            choice = (data.get("choices") or [{}])[0]
+            finish_reason = choice.get("finish_reason")
+            content = (choice.get("message") or {}).get("content")
+            if isinstance(content, list):
+                content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+            if finish_reason == "error" or not content:
+                err_msg = choice.get("error") or f"пустой ответ, finish_reason={finish_reason}"
+                raise RuntimeError(str(err_msg))
             break
         except urllib.error.HTTPError as error:
             body = error.read().decode("utf-8", errors="replace")
@@ -206,18 +218,16 @@ def call_openrouter(model: dict, system: str, user: str, api_key: str) -> dict:
         except urllib.error.URLError as error:
             last_error = str(error)
             time.sleep(5 * (attempt + 1))
+        except RuntimeError as error:
+            last_error = str(error)
+            time.sleep(5 * (attempt + 1))
     else:
         raise RuntimeError(last_error or "запрос не прошёл")
-
-    if "error" in data and not data.get("choices"):
-        raise RuntimeError(json.dumps(data["error"], ensure_ascii=False)[:300])
 
     choice = (data.get("choices") or [{}])[0]
     content = (choice.get("message") or {}).get("content")
     if isinstance(content, list):
         content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-    if not content:
-        raise RuntimeError(f"пустой ответ, finish_reason={choice.get('finish_reason')}")
 
     usage = data.get("usage") or {}
     return {
@@ -227,7 +237,7 @@ def call_openrouter(model: dict, system: str, user: str, api_key: str) -> dict:
         "cost": usage.get("cost"),
         "num_ctx": None,
         "context_limit": None,
-        "truncated": data["choices"][0].get("finish_reason") == "length",
+        "truncated": choice.get("finish_reason") == "length",
         "warning": None,
     }
 
@@ -442,6 +452,7 @@ def write_outputs(out_dir: Path, transcript_name: str, transcript: str, store: d
 def main() -> int:
     parser = argparse.ArgumentParser(description="Сравнение моделей на протоколе встречи")
     parser.add_argument("--transcript", type=Path, default=DEFAULT_TRANSCRIPT)
+    parser.add_argument("--system-prompt", type=Path, default=SYSTEM_PROMPT_PATH, help="путь к системному промпту")
     parser.add_argument("--models", help="список меток через запятую, например gpt-oss-20b,gpt-4.1-mini")
     parser.add_argument("--date", default=UNKNOWN_FIELD, help="что подставить в [Date] шаблона")
     parser.add_argument("--users", default=UNKNOWN_FIELD, help="что подставить в [Users] шаблона")
@@ -482,12 +493,15 @@ def main() -> int:
     if not args.transcript.exists():
         print(f"Нет файла стенограммы: {args.transcript}")
         return 1
-    for path in (SYSTEM_PROMPT_PATH, USER_PROMPT_PATH):
+    system_prompt_path = args.system_prompt
+    if not system_prompt_path.is_absolute():
+        system_prompt_path = BASE / system_prompt_path
+    for path in (system_prompt_path, USER_PROMPT_PATH):
         if not path.exists():
             print(f"Нет файла промпта: {path}")
             return 1
 
-    system = read_text(SYSTEM_PROMPT_PATH).strip()
+    system = read_text(system_prompt_path).strip()
     transcript = read_text(args.transcript).strip()
     user = build_user_message(read_text(USER_PROMPT_PATH).strip(), transcript, args.date, args.users)
     api_key = load_api_key()
@@ -496,7 +510,7 @@ def main() -> int:
         return 1
 
     print(f"Стенограмма: {args.transcript.name}, {len(transcript)} символов, ~{estimate_tokens(transcript)} токенов")
-    print(f"Промпты: {SYSTEM_PROMPT_PATH.name} {len(system)} символов, {USER_PROMPT_PATH.name} с датой «{args.date}», участниками «{args.users}»")
+    print(f"Промпты: {system_prompt_path.name} {len(system)} символов, {USER_PROMPT_PATH.name} с датой «{args.date}», участниками «{args.users}»")
     print(f"Моделей в прогоне: {len(selected)}\n")
 
     use_mlflow = not args.no_mlflow
@@ -504,8 +518,7 @@ def main() -> int:
         if mlflow is None:
             print("Ошибка: пакет mlflow не установлен. Установите: pip install -r requirements.txt или используйте флаг --no-mlflow")
             return 1
-        MLFLOW_DIR.mkdir(parents=True, exist_ok=True)
-        mlflow.set_tracking_uri(MLFLOW_DIR.as_uri())
+        mlflow.set_tracking_uri(f"sqlite:///{MLFLOW_DB_PATH.as_posix()}")
         mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
 
     out_dir = RESULTS_DIR / args.transcript.stem
@@ -523,6 +536,7 @@ def main() -> int:
             "transcript_stem": args.transcript.stem,
             "transcript_chars": len(transcript),
             "transcript_estimated_tokens": estimate_tokens(transcript),
+            "system_prompt_name": system_prompt_path.name,
             "date_arg": args.date,
             "users_arg": args.users,
             "models_count": len(selected),

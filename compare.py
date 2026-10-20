@@ -10,6 +10,14 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
+os.environ.setdefault("MLFLOW_DISABLE_AGENT_HINT", "1")
+
+try:
+    import mlflow
+except ImportError:
+    mlflow = None
+
 BASE = Path(__file__).resolve().parent
 # Промпты один в один с продуктового сервера: системный и шаблон сообщения пользователя.
 SYSTEM_PROMPT_PATH = BASE / "Promt" / "System promt.md"
@@ -19,6 +27,8 @@ UNKNOWN_FIELD = "Уточнити"
 MEETING_DIR = BASE / "Meeting"
 RESULTS_DIR = BASE / "results"
 DEFAULT_TRANSCRIPT = next(MEETING_DIR.glob("*.txt"), MEETING_DIR / "transcript.txt")
+MLFLOW_EXPERIMENT_NAME = "meeting-protocol-eval"
+MLFLOW_DIR = BASE / "mlruns"
 
 ENV_FILES = [
     BASE / ".env",
@@ -432,6 +442,7 @@ def main() -> int:
     parser.add_argument("--users", default=UNKNOWN_FIELD, help="что подставить в [Users] шаблона")
     parser.add_argument("--list", action="store_true", help="показать кандидатов и выйти")
     parser.add_argument("--rebuild", action="store_true", help="пересобрать файлы из runs.json, без запросов к моделям")
+    parser.add_argument("--no-mlflow", action="store_true", help="не логировать прогон в MLflow")
     args = parser.parse_args()
 
     if args.rebuild:
@@ -483,43 +494,138 @@ def main() -> int:
     print(f"Промпты: {SYSTEM_PROMPT_PATH.name} {len(system)} символов, {USER_PROMPT_PATH.name} с датой «{args.date}», участниками «{args.users}»")
     print(f"Моделей в прогоне: {len(selected)}\n")
 
+    use_mlflow = not args.no_mlflow
+    if use_mlflow:
+        if mlflow is None:
+            print("Ошибка: пакет mlflow не установлен. Установите: pip install -r requirements.txt или используйте флаг --no-mlflow")
+            return 1
+        MLFLOW_DIR.mkdir(parents=True, exist_ok=True)
+        mlflow.set_tracking_uri(MLFLOW_DIR.as_uri())
+        mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+
     out_dir = RESULTS_DIR / args.transcript.stem
     raw_dir = out_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
     store = load_store(out_dir)
 
-    for model in selected:
-        print(f"[{model['label']}] запуск...", flush=True)
-        result = run_model(model, system, user, api_key)
-        if result["error"]:
-            print(f"[{model['label']}] ошибка: {result['error']}")
-        else:
-            cost = result["cost"]
-            money = f", ${cost:.4f}" if cost else ""
-            print(f"[{model['label']}] готово за {result['seconds']} с, {len(result['text'] or '')} символов{money}")
-            if result["warning"]:
-                print(f"[{model['label']}] внимание: {result['warning']}")
-        if result["text"]:
-            (raw_dir / f"{model['label']}.md").write_text(result["text"], encoding="utf-8")
-        store[model["label"]] = {
-            "model_id": model["id"],
-            "kind": model["kind"],
-            "prompt_tokens": result["prompt_tokens"],
-            "completion_tokens": result["completion_tokens"],
-            "cost": result["cost"],
-            "seconds": result["seconds"],
-            "truncated": result["truncated"],
-            "warning": result["warning"],
-            "error": result["error"],
-            "ran_at": f"{datetime.now():%d.%m.%Y %H:%M}",
-        }
+    prices = fetch_pricing()
+    parent_run = None
+    if use_mlflow:
+        run_name = f"{args.transcript.stem}_{datetime.now():%Y%m%d_%H%M%S}"
+        parent_run = mlflow.start_run(run_name=run_name)
+        mlflow.log_params({
+            "transcript_name": args.transcript.name,
+            "transcript_stem": args.transcript.stem,
+            "transcript_chars": len(transcript),
+            "transcript_estimated_tokens": estimate_tokens(transcript),
+            "date_arg": args.date,
+            "users_arg": args.users,
+            "models_count": len(selected),
+            "temperature": TEMPERATURE,
+        })
+        mlflow.set_tag("session_type", "live_compare")
 
-    save_store(out_dir, store)
-    write_outputs(out_dir, args.transcript.stem, transcript, store)
+    try:
+        for model in selected:
+            print(f"[{model['label']}] запуск...", flush=True)
+            result = run_model(model, system, user, api_key)
+            cost = result["cost"]
+            if model["kind"] == "openrouter" and (cost is None or cost == 0):
+                calculated = calc_cost(model["id"], result["prompt_tokens"], result["completion_tokens"], prices)
+                if calculated is not None:
+                    cost = calculated
+            result["cost"] = cost
+
+            if result["error"]:
+                print(f"[{model['label']}] ошибка: {result['error']}")
+            else:
+                money = f", ${cost:.4f}" if cost else ""
+                print(f"[{model['label']}] готово за {result['seconds']} с, {len(result['text'] or '')} символов{money}")
+                if result["warning"]:
+                    print(f"[{model['label']}] внимание: {result['warning']}")
+            if result["text"]:
+                (raw_dir / f"{model['label']}.md").write_text(result["text"], encoding="utf-8")
+            store[model["label"]] = {
+                "model_id": model["id"],
+                "kind": model["kind"],
+                "prompt_tokens": result["prompt_tokens"],
+                "completion_tokens": result["completion_tokens"],
+                "cost": result["cost"],
+                "seconds": result["seconds"],
+                "truncated": result["truncated"],
+                "warning": result["warning"],
+                "error": result["error"],
+                "ran_at": f"{datetime.now():%d.%m.%Y %H:%M}",
+            }
+
+            if parent_run is not None:
+                with mlflow.start_run(run_name=model["label"], nested=True):
+                    mlflow.log_params({
+                        "model_id": model["id"],
+                        "model_kind": model["kind"],
+                        "temperature": TEMPERATURE,
+                    })
+                    if result["error"]:
+                        mlflow.set_tag("status", "failed")
+                        mlflow.log_param("error_message", str(result["error"])[:250])
+                        mlflow.log_metric("seconds", float(result["seconds"]))
+                    else:
+                        mlflow.set_tag("status", "success")
+                        metrics = {
+                            "seconds": float(result["seconds"]),
+                            "protocol_chars": float(len(result["text"] or "")),
+                            "truncated": 1.0 if result["truncated"] else 0.0,
+                        }
+                        if result["prompt_tokens"] is not None:
+                            metrics["prompt_tokens"] = float(result["prompt_tokens"])
+                        if result["completion_tokens"] is not None:
+                            metrics["completion_tokens"] = float(result["completion_tokens"])
+                        if result["prompt_tokens"] is not None and result["completion_tokens"] is not None:
+                            metrics["total_tokens"] = float(result["prompt_tokens"] + result["completion_tokens"])
+                        if cost is not None:
+                            metrics["cost_usd"] = float(cost)
+
+                        checks = result.get("checks")
+                        if checks:
+                            metrics["sections_found"] = float(len(checks["sections"]))
+                            metrics["sections_total"] = float(len(SECTION_TITLES))
+                            metrics["sections_order_valid"] = 1.0 if checks["sections"] == sorted(checks["sections"]) else 0.0
+                            metrics["utochnyty_count"] = float(checks["utochnyty"])
+                            metrics["dates_count"] = float(checks["dates"])
+                            metrics["tables_count"] = float(checks["tables"])
+
+                        mlflow.log_metrics(metrics)
+
+                        text_file = raw_dir / f"{model['label']}.md"
+                        if text_file.exists():
+                            mlflow.log_artifact(str(text_file), artifact_path="protocol")
+
+        save_store(out_dir, store)
+        write_outputs(out_dir, args.transcript.stem, transcript, store)
+
+        if parent_run is not None:
+            successful_count = sum(1 for m in selected if not store.get(m["label"], {}).get("error"))
+            failed_count = sum(1 for m in selected if store.get(m["label"], {}).get("error"))
+            total_cost = sum(store.get(m["label"], {}).get("cost") or 0.0 for m in selected)
+            mlflow.log_metrics({
+                "successful_models": float(successful_count),
+                "failed_models": float(failed_count),
+                "total_cost_usd": float(total_cost),
+            })
+            for report_file in ("results.md", "for_opus.md", "key.md", "runs.json"):
+                report_path = out_dir / report_file
+                if report_path.exists():
+                    mlflow.log_artifact(str(report_path), artifact_path="reports")
+    finally:
+        if parent_run is not None and mlflow.active_run():
+            mlflow.end_run()
+
     print(f"\nГотово. Файлы в {out_dir}")
     print("  for_opus.md  несите в веб-интерфейс Claude, там протоколы обезличены")
     print("  results.md   цифры и имена моделей, открывать после оценки")
     print("  key.md       ключ соответствия А/Б/В/Г")
+    if use_mlflow:
+        print("  mlruns/      записи в MLflow (просмотр: mlflow ui)")
     return 0
 
 

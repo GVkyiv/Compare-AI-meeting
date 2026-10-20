@@ -19,3 +19,10 @@ venv/
 
 .DS_Store
 Thumbs.db
+
+# MLflow трекинг и артефакты (содержат протоколы и стенограммы)
+mlruns/
+mlruns.db
+*.db
+.trash/
+

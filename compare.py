@@ -43,12 +43,16 @@ OUTPUT_RESERVE_TOKENS = 4000
 
 # Список кандидатов. kind: openrouter или ollama. enabled: участвует ли в прогоне.
 MODELS = [
-    {"label": "gpt-oss-20b", "kind": "openrouter", "id": "openai/gpt-oss-20b", "enabled": True},
-    {"label": "gpt-oss-120b", "kind": "openrouter", "id": "openai/gpt-oss-120b", "enabled": True},
-    {"label": "qwen3.5-27b", "kind": "openrouter", "id": "qwen/qwen3.5-27b", "enabled": True},
-    {"label": "gpt-4.1-mini", "kind": "openrouter", "id": "openai/gpt-4.1-mini", "enabled": True},
-    {"label": "gpt-5.6-luna", "kind": "openrouter", "id": "openai/gpt-5.6-luna", "enabled": True},
-    {"label": "qwen3.8-27b", "kind": "openrouter", "id": "qwen/qwen3.8-27b", "enabled": True},
+    {"label": "qwen3.8-27b-ud", "kind": "ollama", "id": "Qwen3.8-27B-UD-Q6_K_XL", "enabled": True},
+    {"label": "command-r-35b", "kind": "ollama", "id": "command-r:35b", "enabled": True},
+    {"label": "mistral-small-24b", "kind": "ollama", "id": "mistral-small:24b", "enabled": True},
+    {"label": "qwen2.5-32b", "kind": "ollama", "id": "qwen2.5:32b-instruct", "enabled": True},
+    {"label": "gpt-oss-20b", "kind": "openrouter", "id": "openai/gpt-oss-20b", "enabled": False},
+    {"label": "gpt-oss-120b", "kind": "openrouter", "id": "openai/gpt-oss-120b", "enabled": False},
+    {"label": "qwen3.5-27b", "kind": "openrouter", "id": "qwen/qwen3.5-27b", "enabled": False},
+    {"label": "gpt-4.1-mini", "kind": "openrouter", "id": "openai/gpt-4.1-mini", "enabled": False},
+    {"label": "gpt-5.6-luna", "kind": "openrouter", "id": "openai/gpt-5.6-luna", "enabled": False},
+    {"label": "qwen3.8-27b", "kind": "openrouter", "id": "qwen/qwen3.8-27b", "enabled": False},
     {"label": "gpt-oss-20b-local", "kind": "ollama", "id": "gpt-oss-20b-GGUF:Q4_K_M", "enabled": False},
     {"label": "qwen3.5-local", "kind": "ollama", "id": "qwen3.5:latest", "enabled": False},
 ]
@@ -353,6 +357,7 @@ def write_outputs(out_dir: Path, transcript_name: str, transcript: str, store: d
             result["text"],
             "",
         ]
+    (out_dir / "for_eval.md").write_text("\n".join(parts), encoding="utf-8")
     (out_dir / "for_opus.md").write_text("\n".join(parts), encoding="utf-8")
 
     key_lines = [
@@ -373,7 +378,7 @@ def write_outputs(out_dir: Path, transcript_name: str, transcript: str, store: d
         f"Дата прогона: {datetime.now():%d.%m.%Y %H:%M}. Температура {TEMPERATURE}, один прогон на модель,",
         "промпт и стенограмма одинаковые для всех.",
         "",
-        "**Здесь видно, где какая модель. Открывать после того, как оценка по `for_opus.md` выставлена.**",
+        "**Здесь видно, где какая модель. Открывать после того, как оценка по `for_eval.md` выставлена.**",
         "",
         f"| Модель | Токены вход | Токены выход | Стоимость, $ | Время, с | Символов | Разделов из {len(SECTION_TITLES)} | «Уточнити» | Обрезка |",
         "|---|---|---|---|---|---|---|---|---|",
@@ -612,7 +617,7 @@ def main() -> int:
                 "failed_models": float(failed_count),
                 "total_cost_usd": float(total_cost),
             })
-            for report_file in ("results.md", "for_opus.md", "key.md", "runs.json"):
+            for report_file in ("results.md", "for_eval.md", "for_opus.md", "key.md", "runs.json"):
                 report_path = out_dir / report_file
                 if report_path.exists():
                     mlflow.log_artifact(str(report_path), artifact_path="reports")
@@ -621,7 +626,8 @@ def main() -> int:
             mlflow.end_run()
 
     print(f"\nГотово. Файлы в {out_dir}")
-    print("  for_opus.md  несите в веб-интерфейс Claude, там протоколы обезличены")
+    print("  for_eval.md  протоколы обезличены, для слепой оценки")
+    print("  for_opus.md  (алиас for_eval.md)")
     print("  results.md   цифры и имена моделей, открывать после оценки")
     print("  key.md       ключ соответствия А/Б/В/Г")
     if use_mlflow:
